@@ -335,8 +335,7 @@ struct GenState {
 ** in MSVC 2008.
 */
 const char zTopLine[] =
-  "/* \aThis file was automatically generated.  Do not edit! */\n"
-  "#undef INTERFACE\n";
+  "/* \aThis file was automatically generated. Do not edit! */\n\n";
 #define nTopLine (sizeof(zTopLine)-1)
 
 /*
@@ -1019,7 +1018,10 @@ static int GetNonspaceToken(InStream *pIn, Token *pToken){
        pToken->eType!=TT_Space ? pToken->zText : "<space>"); */
     pToken->pComment = blockComment;
     switch( pToken->eType ){
-      case TT_Comment:
+      case TT_Comment:          /*0123456789 12345678 */
+       if( strncmp(pToken->zText, "/*MAKEHEADERS-STOP", 18)==0 ) return nErr;
+       break;
+
       case TT_Space:
         break;
 
@@ -1108,7 +1110,7 @@ static void FindIdentifiersInMacro(Token *pToken, IdentTable *pTable){
 ** unterminated token.
 */
 static int GetBigToken(InStream *pIn, Token *pToken, IdentTable *pTable){
-  const char *z, *zStart;
+  const char *zStart;
   int iStart;
   int nBrace;
   int c;
@@ -1137,7 +1139,6 @@ static int GetBigToken(InStream *pIn, Token *pToken, IdentTable *pTable){
       return nErr;
   }
 
-  z = pIn->z;
   iStart = pIn->i;
   zStart = pToken->zText;
   nLine = pToken->nLine;
@@ -1420,11 +1421,11 @@ static char *TokensToString(
       default:
         c = pFirst->zText[0];
         if( needSpace && (c=='*' || c=='{') ){
-          StringAppend(&str," ",1);
+          /*StringAppend(&str,"?",1);*/
         }
         StringAppend(&str,pFirst->zText,pFirst->nText);
-        /* needSpace = pFirst->zText[0]==','; */
-        needSpace = 0;
+        needSpace = (pFirst->zText[0]==',' || pFirst->zText[0]=='*');
+        /*needSpace = 0;*/
         break;
     }
     pFirst = pFirst->pNext;
@@ -1432,6 +1433,7 @@ static char *TokensToString(
   if( zTerm && *zTerm ){
     StringAppend(&str,zTerm,strlen(zTerm));
   }
+  StringAppend(&str,"\n",strlen("\n"));
   zReturn = StrDup(StringGet(&str),0);
   StringReset(&str);
   return zReturn;
@@ -1472,6 +1474,7 @@ static int ProcessTypeDecl(Token *pList, int flags, int *pReset){
   for(pEnd=pName->pNext; pEnd && pEnd->eType!=TT_Braces; pEnd=pEnd->pNext){
     switch( pEnd->zText[0] ){
       case '(':
+      case ')':
       case '*':
       case '[':
       case '=':
@@ -1683,14 +1686,12 @@ static Token *FindDeclName(Token *pFirst, Token *pLast){
 ** added to their class definitions.
 */
 static int ProcessMethodDef(Token *pFirst, Token *pLast, int flags){
-  Token *pCode;
   Token *pClass;
   char *zDecl;
   Decl *pDecl;
   String str;
   int type;
 
-  pCode = pLast;
   pLast = pLast->pPrev;
   while( pFirst->zText[0]=='P' ){
     int rc = 1;
@@ -1972,9 +1973,14 @@ static int ProcessDecl(Token *pFirst, Token *pEnd, int flags){
   }
   pName = FindDeclName(pFirst,pEnd->pPrev);
   if( pName==0 ){
-    fprintf(stderr,"%s:%d: Can't find a name for the object declared here.\n",
-      zFilename, pFirst->nLine);
-    return nErr+1;
+    if( pFirst->nText==4 && strncmp(pFirst->zText,"enum",4)==0 ){
+      /* Ignore completely anonymous enums.  See documentation section 3.8.1. */
+      return nErr;
+    }else{
+      fprintf(stderr,"%s:%d: Can't find a name for the object declared here.\n",
+        zFilename, pFirst->nLine);
+      return nErr+1;
+    }
   }
 
 #ifdef DEBUG
@@ -2181,6 +2187,8 @@ static int ParsePreprocessor(Token *pToken, int flags, int *pPresetFlags){
     }else if( nArg==16 && strncmp(zArg,"EXPORT_INTERFACE",16)==0 ){
       PushIfMacro(0,0,0,pToken->nLine,PS_Export);
     }else if( nArg==15 && strncmp(zArg,"LOCAL_INTERFACE",15)==0 ){
+      PushIfMacro(0,0,0,pToken->nLine,PS_Local);
+    }else if( nArg==15 && strncmp(zArg,"MAKEHEADERS_STOPLOCAL_INTERFACE",15)==0 ){
       PushIfMacro(0,0,0,pToken->nLine,PS_Local);
     }else{
       PushIfMacro(0,zArg,nArg,pToken->nLine,0);
@@ -2784,6 +2792,48 @@ static void CompleteForwardDeclarations(GenState *pState){
 }
 
 /*
+** Return header guard string, to be freed by caller, 0 is start, non-zero end
+*/
+static char* getHeaderGuard(InFile *pFile, int lap)
+{
+  char *buffer;
+
+  if (lap == 0) {
+    const char *prefix = "#ifndef ";
+    int prefixLen, nameLen, sz;
+    int i;
+
+    prefixLen = strlen(prefix);
+    nameLen = strlen(pFile->zHdr);
+    sz = prefixLen*2 + nameLen*2 + 6; /* 2_ + 3\n + \0*/
+
+    buffer = SafeMalloc(sz);
+
+    snprintf(buffer,sz,"%s%s_\n%s%s_\n\n",
+             prefix,pFile->zHdr,"#define ",pFile->zHdr);
+
+    for (i = prefixLen; i < prefixLen + nameLen; i++) {
+      const char c = buffer[i];
+      if (c == '.') {
+        buffer[i] = '_';
+      }
+      else {
+        buffer[i] = toupper((unsigned char)c);
+      }
+    }
+
+    memcpy(strchr(buffer, '\n') + prefixLen + 1,buffer + prefixLen,nameLen);
+  }
+  else {
+    const char* str = "#endif\n";
+    buffer = SafeMalloc(strlen(str) + 1);
+    strcpy(buffer, str);
+  }
+
+  return buffer;
+}
+
+/*
 ** Generate an include file for the given source file.  Return the number
 ** of errors encountered.
 **
@@ -2798,11 +2848,18 @@ static int MakeHeader(InFile *pFile, FILE *report, int nolocal_flag){
   Ident *pId;
   char *zNewVersion;
   char *zOldVersion;
+  char *guard;
 
   if( pFile->zHdr==0 || *pFile->zHdr==0 ) return 0;
   sState.pStr = &outStr;
   StringInit(&outStr);
+
   StringAppend(&outStr,zTopLine,nTopLine);
+
+  guard = getHeaderGuard(pFile, 0);
+  StringAppend(&outStr,guard,strlen(guard));
+  free(guard);
+
   sState.pTable = &includeTable;
   memset(&includeTable,0,sizeof(includeTable));
   sState.zIf = 0;
@@ -2820,6 +2877,11 @@ static int MakeHeader(InFile *pFile, FILE *report, int nolocal_flag){
   ChangeIfContext(0,&sState);
   nErr += sState.nErr;
   zOldVersion = ReadFile(pFile->zHdr);
+
+  guard = getHeaderGuard(pFile, -1);
+  StringAppend(&outStr,guard,strlen(guard));
+  free(guard);
+
   zNewVersion = StringGet(&outStr);
   if( report ) fprintf(report,"%s: ",pFile->zHdr);
   if( zOldVersion==0 ){
@@ -3282,6 +3344,12 @@ int main(int argc, char **argv){
   FILE *report;         /* Send progress reports to this, if not NULL */
 
   noMoreFlags = 0;
+
+  if (argc < 2 || !strcmp(argv[1], "-help") || !strcmp(argv[1], "--help")) {
+    Usage(*argv, "");
+    return 1;
+  }
+
   for(i=1; i<argc; i++){
     if( argv[i][0]=='-' && !noMoreFlags ){
       switch( argv[i][1] ){
