@@ -2,4 +2,6 @@
 
 makeheaders c build tool for generating c source header files (Part of Fossil-SCM)
 
-Building under msys2 requires `cmake -G "MSYS Makefiles"`
+Just compile with -ansi -Wall + -O3/-g
+
+My fork just add header guard and beautify a little bit
